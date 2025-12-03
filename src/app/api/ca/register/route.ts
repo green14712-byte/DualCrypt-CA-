@@ -1,45 +1,65 @@
+// src/app/api/ca/register/route.ts
 import { NextRequest, NextResponse } from 'next/server'
-import fs from 'fs'
-import path from 'path'
 import crypto from 'crypto'
+import { getPublicKeyHash, buildCertPayload } from '../utils'
 
-const CA_KEY_PATH = path.join(process.cwd(), 'ca', 'rootCA.key')
-const ISSUED_DIR = path.join(process.cwd(), 'ca', 'issued')
+// .env에서 읽어온 PEM 문자열의 "\n"을 실제 개행으로 복원
+function loadPemFromEnv(varName: string): string {
+  const value = process.env[varName]
+  if (!value) {
+    throw new Error(`${varName} 환경 변수가 설정되어 있지 않습니다.`)
+  }
+  // "\\n" 문자열을 실제 개행 문자로 교체
+  return value.replace(/\\n/g, '\n')
+}
 
-if (!fs.existsSync(ISSUED_DIR)) {
-  fs.mkdirSync(ISSUED_DIR, { recursive: true })
+let CA_PRIVATE_KEY: string
+try {
+  CA_PRIVATE_KEY = loadPemFromEnv('CA_PRIVATE_KEY')
+} catch (err) {
+  console.error(err)
+  // 에러가 나도 타입 맞추려고 빈 문자열로 초기화
+  CA_PRIVATE_KEY = ''
 }
 
 export async function POST(req: NextRequest) {
-  const formData = await req.formData()
-  const username = formData.get('username') as string | null
-  const pubkeyFile = formData.get('pubkey') as File | null
+  try {
+    const formData = await req.formData()
+    const username = formData.get('username')?.toString().trim()
+    const pubFile = formData.get('pubkey') as File | null
 
-  if (!username || !pubkeyFile) {
-    return new NextResponse('username 또는 공개키가 없습니다.', { status: 400 })
+    if (!username || !pubFile) {
+      return new NextResponse('username 또는 공개키 파일이 없습니다.', {
+        status: 400,
+      })
+    }
+
+    // 업로드된 공개키 PEM 텍스트
+    const pubPem = await pubFile.text()
+
+    // 공개키 해시 계산 (PEM 문자열 자체에 SHA-256)
+    const pubHash = getPublicKeyHash(pubPem)
+
+    // 서명 대상 payload
+    const payload = buildCertPayload(username, pubHash)
+
+    // CA 개인키로 서명 (여기서 CA_PRIVATE_KEY가 제대로 된 PEM이어야 함)
+    const signature = crypto
+      .sign('sha256', Buffer.from(payload, 'utf8'), {
+        key: CA_PRIVATE_KEY,
+      })
+      .toString('base64')
+
+    const cert = {
+      username,
+      pubkey_sha256: pubHash,
+      signature,
+    }
+
+    return NextResponse.json(cert)
+  } catch (err: unknown) {
+    console.error('Register error:', err)
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    return new NextResponse(`인증서 발급 실패: ${msg}`, { status: 500 })
   }
-
-  const pubPem = Buffer.from(await pubkeyFile.arrayBuffer())
-
-  // 1) 공개키 해시 계산
-  const hashHex = crypto.createHash('sha256').update(pubPem).digest('hex')
-
-  // 2) CA 개인키 로드
-  const caPrivPem = fs.readFileSync(CA_KEY_PATH, 'utf8')
-  const caPrivKey = crypto.createPrivateKey(caPrivPem)
-
-  // 3) 공개키에 CA가 서명
-  const signature = crypto.sign('sha256', pubPem, caPrivKey)
-  const signatureB64 = signature.toString('base64')
-
-  const cert = {
-    username,
-    pubkey_sha256: hashHex,
-    signature: signatureB64,
-  }
-
-  const certPath = path.join(ISSUED_DIR, `${username}.cert.json`)
-  fs.writeFileSync(certPath, JSON.stringify(cert, null, 2), 'utf8')
-
-  return NextResponse.json(cert)
 }
